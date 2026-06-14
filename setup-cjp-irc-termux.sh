@@ -1,8 +1,8 @@
 #!/data/data/com.termux/files/usr/bin/bash
 #
 # CJP IRC Server - Termux Setup Script
-# Automates: ngIRCd install, bore install (via cargo), Let's Encrypt cert via acme.sh + DuckDNS,
-# SSL config, channels, and a start script.
+# Installs Ergo (IRCv3 IRC server), bore (TCP tunnel via cargo/rust),
+# and acme.sh + DuckDNS for a trusted Let's Encrypt TLS certificate.
 #
 # Run with: bash setup-cjp-irc-termux.sh
 #
@@ -18,22 +18,16 @@ read -rp "Enter your DuckDNS domain (e.g. cjp-test-irc.duckdns.org): " DUCKDNS_D
 read -rp "Enter your DuckDNS token: " DUCKDNS_TOKEN
 read -rp "Enter your email (for Let's Encrypt): " LE_EMAIL
 read -rp "Enter desired fixed bore port (e.g. 56926): " BORE_PORT
-read -rp "Enter an oper username [admin]: " OPER_NAME
-OPER_NAME=${OPER_NAME:-admin}
-read -rsp "Enter an oper password: " OPER_PASS
-echo
 
-CONF="$PREFIX/etc/ngircd.conf"
-
-# ---- 1. Install packages ----
+# ---- 1. Install base packages ----
 echo
-echo "--- Installing packages (ngircd, openssl, irssi, rust, nano, curl) ---"
+echo "--- Installing base packages ---"
 pkg update -y
-pkg install -y ngircd openssl-tool irssi rust nano curl
+pkg install -y irssi nano curl openssl-tool rust
 
-# ---- 1b. Install bore via cargo ----
+# ---- 2. Install bore via cargo ----
 echo
-echo "--- Installing bore-cli via cargo (this may take several minutes on a phone) ---"
+echo "--- Installing bore-cli via cargo (may take several minutes on a phone) ---"
 export PATH="$HOME/.cargo/bin:$PATH"
 if ! command -v bore &>/dev/null; then
     cargo install bore-cli
@@ -42,17 +36,35 @@ else
     echo "bore already installed, skipping."
 fi
 
-# ---- 2. Install acme.sh ----
+# ---- 3. Download Ergo binary ----
+echo
+echo "--- Downloading Ergo v2.18.0 (ARM64) ---"
+cd ~
+curl -L https://github.com/ergochat/ergo/releases/download/v2.18.0/ergo-2.18.0-linux-arm64.tar.gz -o ergo.tar.gz
+tar xzf ergo.tar.gz
+mkdir -p ~/bin
+cp ~/ergo-2.18.0-linux-arm64/ergo ~/bin/ergo
+export PATH="$HOME/bin:$PATH"
+echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.bashrc"
+
+# ---- 4. Set up Ergo config directory ----
+echo
+echo "--- Setting up Ergo config directory ---"
+mkdir -p ~/.ergo
+cp ~/ergo-2.18.0-linux-arm64/default.yaml ~/.ergo/ircd.yaml
+cp ~/ergo-2.18.0-linux-arm64/ergo.motd ~/.ergo/ergo.motd
+cp -r ~/ergo-2.18.0-linux-arm64/languages ~/.ergo/languages
+
+# ---- 5. Install acme.sh ----
 echo
 echo "--- Installing acme.sh ---"
 if [ ! -d "$HOME/.acme.sh" ]; then
     curl https://get.acme.sh | sh -s email="$LE_EMAIL" --force
 fi
-# shellcheck disable=SC1090
 source "$HOME/.bashrc" 2>/dev/null || true
 ACME="$HOME/.acme.sh/acme.sh"
 
-# ---- 3. Issue certificate via DuckDNS DNS challenge ----
+# ---- 6. Issue Let's Encrypt certificate via DuckDNS ----
 echo
 echo "--- Issuing Let's Encrypt certificate for $DUCKDNS_DOMAIN ---"
 export DuckDNS_Token="$DUCKDNS_TOKEN"
@@ -65,87 +77,73 @@ CERT_DIR="$HOME/.acme.sh/${DUCKDNS_DOMAIN}_ecc"
 FULLCHAIN="$CERT_DIR/fullchain.cer"
 KEYFILE="$CERT_DIR/${DUCKDNS_DOMAIN}.key"
 
-# ---- 4. Write ngircd.conf ----
+# ---- 7. Patch ircd.yaml ----
 echo
-echo "--- Writing $CONF ---"
-cat > "$CONF" <<EOF
-[Global]
-    Name = irc.cjp.local
-    Info = Cockroach Janta Party IRC Server
-    AdminInfo1 = Run by CJP
-    Ports = 6667
+echo "--- Configuring Ergo ---"
 
-[SSL]
-    Ports = 6697
-    CertFile = $FULLCHAIN
-    KeyFile = $KEYFILE
+# Fix server name (avoid duplicate key issue)
+sed -i "s/name: ErgoTest/name: $DUCKDNS_DOMAIN/" ~/.ergo/ircd.yaml
 
-[Limits]
-    MaxNickLength = 20
-    PingTimeout = 60
-    PongTimeout = 20
+# Fix TLS cert/key paths
+sed -i "s|cert: fullchain.pem|cert: $FULLCHAIN|" ~/.ergo/ircd.yaml
+sed -i "s|key: privkey.pem|key: $KEYFILE|" ~/.ergo/ircd.yaml
 
-[Operator]
-    Name = $OPER_NAME
-    Password = $OPER_PASS
+echo "Ergo config written to ~/.ergo/ircd.yaml"
 
-[Channel]
-    Name = #cjp
-    Topic = Welcome to the Cockroach Janta Party! General discussion here.
-    Modes = tn
-
-[Channel]
-    Name = #cjp-help
-    Topic = Ask questions about the CJP server here.
-    Modes = tn
-EOF
-
-echo "Config written to $CONF"
-
-# ---- 5. Write the start script ----
+# ---- 8. Initialize Ergo database ----
 echo
-echo "--- Writing start-cjp-irc.sh ---"
+echo "--- Initializing Ergo database ---"
+cd ~/.ergo
+ergo initdb --conf ircd.yaml
+
+# ---- 9. Write the start script ----
+echo
+echo "--- Writing ~/start-cjp-irc.sh ---"
 cat > "$HOME/start-cjp-irc.sh" <<EOF
 #!/data/data/com.termux/files/usr/bin/bash
-export PATH="\$HOME/.cargo/bin:\$PATH"
-ngircd -n -f $CONF &
+export PATH="\$HOME/bin:\$HOME/.cargo/bin:\$PATH"
+
+# Start Ergo in background
+ergo run --conf ~/.ergo/ircd.yaml &
 sleep 5
-echo -------------------------
+
+echo "-------------------------"
 echo "exposing irc to public..."
-echo -------------------------
+echo "-------------------------"
+
+# Keep bore running with auto-restart
 while true; do
     bore local 6697 --to bore.pub --port $BORE_PORT
     clear
-    echo -------------------
+    echo "-------------------"
     echo "bore disconnected, restarting..."
-    echo -------------------
+    echo "-------------------"
 done
 EOF
 chmod +x "$HOME/start-cjp-irc.sh"
 
-# ---- 6. Done ----
+# ---- 10. Done ----
 echo
 echo "==============================================="
 echo " Setup complete!"
 echo "==============================================="
+echo
 echo "Connection details for CJP members:"
 echo "  Server:  $DUCKDNS_DOMAIN"
 echo "  Port:    $BORE_PORT"
 echo "  TLS:     required (trusted Let's Encrypt cert)"
-echo "  Channel: #cjp"
+echo "  Channel: #cjp (register with /CS REGISTER #cjp after joining)"
 echo
-echo "To start the server, run:"
+echo "IMPORTANT: On the DuckDNS dashboard, set $DUCKDNS_DOMAIN's IP"
+echo "to bore.pub's IP address. Run: nslookup bore.pub to find it."
+echo
+echo "To start the server:"
 echo "  termux-wake-lock"
-echo "  bash ~/start-cjp-irc.sh"
-echo
-echo "(Recommended: run inside tmux so it survives backgrounding:"
 echo "  pkg install tmux -y && tmux new -s irc"
 echo "  bash ~/start-cjp-irc.sh"
-echo "  then Ctrl+B, D to detach)"
+echo "  then Ctrl+B, D to detach"
 echo
-echo "NOTE: On the DuckDNS dashboard, make sure $DUCKDNS_DOMAIN's IP"
-echo "is set to bore.pub's current IP (run: nslookup bore.pub to find it)."
-echo
-echo "Renew the TLS cert every ~60 days with:"
+echo "Renew the TLS cert every ~60 days:"
+echo "  export DuckDNS_Token=\"$DUCKDNS_TOKEN\""
 echo "  $ACME --renew -d $DUCKDNS_DOMAIN --dns dns_duckdns"
 echo "then restart start-cjp-irc.sh."
